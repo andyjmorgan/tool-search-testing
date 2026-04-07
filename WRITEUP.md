@@ -244,6 +244,113 @@ case "tool_search_output":  // server-side result
 
 Both code paths live in `csharp/anthropic/Program.cs` and `csharp/openai/Program.cs` in this repo, and are mirrored in Python at `python/anthropic/anthropic_test.py` and `python/openai/openai_test.py`.
 
+## Updating your agent loop
+
+The tool array changes are the easy part. The agent loop changes are where most teams will trip up, because tool search introduces new content-block types that have to be handled across turns or the loaded tool definitions silently disappear and the model re-pays the search cost on every turn. This section walks through what changes and what does not.
+
+### What does not change
+
+- **The outer loop shape.** You still send a request, walk the response, execute any local tools, append results, and recurse until the model emits an `end_turn` stop reason. The control flow is identical.
+- **Local tool execution.** When the model emits a normal `tool_use` block (Anthropic) or `function_call` item (OpenAI), you execute it the same way as before and reply with a `tool_result` (Anthropic) or `function_call_output` item (OpenAI).
+- **The tools array on every request.** You still send the catalog on every turn. The deferred entries are stable, so you can reuse the same array across turns without rebuilding it.
+- **The system prompt and messages.** No new fields are required on the request beyond the tools array.
+
+### What changes
+
+A pre-tool-search agent loop typically iterates the assistant content like this:
+
+```
+for each block in response.content:
+    if block is text:        accumulate to display
+    if block is tool_use:    schedule for execution
+    if block is thinking:    optionally surface
+    (done)
+```
+
+With tool search enabled, the same iterator must now handle two additional block types per provider, and they come in matched pairs.
+
+**Anthropic** introduces:
+
+- `server_tool_use` — the model's call to BM25 or regex. Contains the query/pattern as input. Server-executed.
+- `tool_search_tool_result` — the matched tool definitions, returned by the server immediately after the corresponding `server_tool_use`.
+
+**OpenAI** introduces:
+
+- `tool_search_call` — the model's search invocation, with `paths` arguments derived from your namespace structure.
+- `tool_search_output` — the matched function definitions, returned immediately after the corresponding `tool_search_call`.
+
+The new loop shape is:
+
+```
+for each block in response.content:
+    if block is text:                    accumulate to display
+    if block is tool_use:                schedule for execution
+    if block is server_tool_use:         preserve in assistant content (no client action)
+    if block is tool_search_tool_result: preserve in assistant content (no client action)
+    if block is thinking:                optionally surface
+    (done)
+```
+
+The two new block types do not require any client-side action. The provider has already executed them. Your only job is to **preserve them, in order, alongside the rest of the assistant's content** when you append the assistant turn to the conversation history.
+
+### The pairing rule
+
+`server_tool_use` and `tool_search_tool_result` are emitted as a matched pair, in that order. Same on the OpenAI side with `tool_search_call` and `tool_search_output`. **You must round-trip both blocks together.** The provider validates this on the next request: if you send the call without the result, or the result without the call, the API rejects the request as malformed.
+
+In practice this means:
+
+- Do not filter or rewrite assistant content in transit. Pass through every block in order.
+- If you compact or summarise old turns to reduce context, evict the entire pair atomically. Never split them.
+- If your message store has a typed model (e.g., separate columns for `text_content`, `tool_uses`, `tool_results`), add new columns for the server-tool blocks rather than dropping them on the floor. The donkeywork-agents reference at `AnthropicProvider.cs:618` shows the round-trip code on Anthropic.
+
+### Multi-turn behaviour
+
+The model will issue a fresh `tool_search` call any time a new turn needs a tool that has not been loaded yet. Each new call appends another (`server_tool_use`, `tool_search_tool_result`) pair to the assistant content for that turn. Over the lifetime of a session, the loaded set grows monotonically, and the cost of each subsequent turn is the baseline plus the search-tool entry fee plus all the previously loaded definitions sitting in the transcript.
+
+A few consequences:
+
+- **Search cost is paid once per tool, not once per turn.** The first turn that needs a tool pays for the search. Every subsequent turn pays the (much smaller) cost of the loaded definitions in transcript history.
+- **The loop does not need to know any of this.** The model decides when to search, the provider executes it, and your loop just round-trips the resulting blocks. There is no client-side bookkeeping to track which tools are loaded.
+- **`stop_reason: tool_use` may now indicate either a local tool call or a search call followed by a local tool call in the same turn.** Both of those resolve to the same client behaviour: walk the content, execute any local tools, append results, recurse. Do not branch on whether the turn contained a search call.
+
+### Eviction and pruning
+
+For long sessions on Anthropic, the loaded `tool_search_tool_result` blocks are sticky and will accumulate. After enough turns the deferred catalog has effectively re-inlined itself in the transcript. You have three options:
+
+1. **Do nothing.** Acceptable if your sessions are short or your catalog is small enough that the accumulated cost stays bounded.
+2. **Prune by age.** Drop assistant turns older than N from the transcript. Make sure you drop the search-call/search-result pair atomically, and ideally also drop any local `tool_use`/`tool_result` pairs that referenced tools loaded by those evicted searches.
+3. **Use Anthropic's `context-management-2025-06-27` beta.** This is a server-side compaction feature that prunes tool-result-class blocks (including `tool_search_tool_result`) by age. It composes cleanly with deferred tool loading.
+
+OpenAI is less affected because the namespace handle stays small and the loaded function definitions are also more compact. For most workloads you can defer this concern.
+
+### Streaming considerations
+
+If you stream responses (most production agents do), the new block types arrive as `content_block_start` and `content_block_delta` events on Anthropic, and as item events on OpenAI's stream. Your stream handler needs new branches:
+
+- **Anthropic**: in your `content_block_start` handler, branch on `BetaToolUseBlock` (existing), `BetaServerToolUseBlock` (new), `BetaToolSearchToolResult` (new), and `BetaWebSearchToolResult` (existing if you also use web search). The donkeywork-agents `AnthropicProvider.StreamCore` method has a working example covering all these block types.
+- **OpenAI**: the Responses API stream emits `response.output_item.added` events for each output item. New item types to handle: `tool_search_call` and `tool_search_output`. They do not have content deltas (the server tool runs synchronously inside the turn) but they do have `id` fields you should preserve for round-tripping.
+
+The non-streaming code path is much simpler because you only walk `response.content` once at the end. If you can get away with non-streaming for the agent loop and stream only the final user-facing text, that is by far the easiest integration path.
+
+### Error handling
+
+Tool search can fail in a few ways:
+
+- **Empty match.** The model issues a search and the server returns no matches. The model usually narrates this and tries another search with different terms. You see a `tool_search_tool_result` block with no loaded tools, then another `server_tool_use` block. No client action needed beyond round-tripping both pairs.
+- **Search-tool error.** Rare, but the result block can carry an error payload. Surface it in your logs. The model will typically narrate and retry.
+- **Unknown tool call.** The model occasionally hallucinates a tool name that isn't in any matched set. Handle this exactly as you would handle an unknown tool name on a normal `tool_use` block: return an error in the `tool_result` and let the model recover. This is rare in practice.
+
+### Diff against your existing loop
+
+If you have an agent loop today that handles `text`, `tool_use`, and `tool_result`, the minimum change to support tool search is:
+
+1. Extend your assistant-content walker with two new branches that preserve the new server-tool block types verbatim. No execution, no parsing, just preserve.
+2. Make sure your message-history serializer round-trips those blocks unchanged, in order, alongside everything else.
+3. Mark your existing tools with `defer_loading: true` (Anthropic) or wrap them in a namespace (OpenAI).
+4. Add the search tool to your tools array.
+
+That is it. Local tool execution, the outer loop, the stop-reason handling, and the system prompt all stay exactly the same. Most agent loops can be updated in well under 100 lines of code.
+
 ## MCP servers and tool search
 
 If your tools come from MCP servers, the integration story is meaningfully different on each provider, and most existing MCP server descriptions are now wrong in a way that costs you money.
