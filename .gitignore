@@ -1,0 +1,10 @@
+bin/
+obj/
+__pycache__/
+*.pyc
+flow.json
+flow_*.json
+.env
+.vs/
+.idea/
+.vscode/
