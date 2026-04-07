@@ -39,21 +39,24 @@ That difference matters when you design your catalog, and I will come back to it
 
 ## The test
 
-A single agent task (*"Find any open P1 incidents from the last 24 hours and tell me which service they belong to"*) executed against a catalog of 21 verbose, realistic tool definitions covering HR, finance, inventory, ticketing, deployments, monitoring, customers, calendar, and docs. Each tool has a multi-sentence description and a JSON Schema, shaped like a real enterprise toolset rather than stubs. The full catalog lives in `csharp/anthropic/Program.cs` in the `MockTools` class and is duplicated verbatim in the other harnesses.
+A single agent task (*"Find any open P1 incidents from the last 24 hours and tell me which service they belong to"*) executed against a catalog of 21 verbose, realistic tool definitions covering HR, finance, inventory, ticketing, deployments, monitoring, customers, calendar, and docs. Each tool has a multi-sentence description and a JSON Schema, shaped like a real enterprise toolset rather than stubs. The full catalog lives in `python/anthropic/mock_tools.py` and is duplicated verbatim in `python/openai/mock_tools.py`.
 
-Two providers, four harnesses:
+Three test surfaces, all in Python with stdlib only:
 
-- **Anthropic** Claude Sonnet 4.6 (`claude-sonnet-4-6`) via the Beta Messages API. Beta header `advanced-tool-use-2025-11-20`. C# harness uses the official `Anthropic` NuGet SDK, Python harness uses stdlib `urllib`.
-- **OpenAI** `gpt-5.4-2026-03-05` via the Responses API. Both harnesses hit the REST endpoint directly because the published SDKs had not yet been updated for `tool_search` when I ran this.
+- **Anthropic** Claude Sonnet 4.6 (`claude-sonnet-4-6`) via the Beta Messages API. Beta header `advanced-tool-use-2025-11-20`.
+- **OpenAI** `gpt-5.4-2026-03-05` via the Responses API.
+- **OpenAI ChatCompletions** for the same model, used by the scale test only because the published OpenAI SDKs had not yet exposed `tool_search` when I ran this and ChatCompletions does not support `tool_search` at all.
 
-Each provider was measured in two modes:
+Each harness measures the same workload in two modes:
 
-1. **Token counting**, to isolate the static cost of each configuration. Anthropic exposes a `count_tokens` endpoint. OpenAI does not, so I make a real `/v1/responses` call with `tool_choice: none` and `max_output_tokens: 16` and read `usage.input_tokens` off the response.
+1. **Token counting**, to isolate the static cost of each configuration. **Anthropic exposes a dedicated `/v1/messages/count_tokens` endpoint** that returns input token counts without invoking the model. **OpenAI does not have this**, so I send a real `/v1/responses` (or `/v1/chat/completions`) call with `tool_choice: "none"` and `max_output_tokens: 16` and read `usage.input_tokens` off the response. Both numbers are the exact server-side counts the providers will bill, not client-side estimates from a local tokenizer.
 2. **Live agent run**, a real two-turn call where the model actually invokes a local tool, the harness returns a mock result, and the model produces a final answer. This is the only way to see the post-search cost (the cost of definitions that the search tool has just injected mid-turn).
 
 For each provider I measured: prompt only, prompt + 21 tools inline, prompt + 21 tools deferred, plus 3-tool variants to expose the slope. On Anthropic I measured both BM25 and regex deferred modes. On OpenAI I measured both the flat per-function `defer_loading` and the namespace-wrapped form.
 
-All requests and responses are captured to `flow.json` files in each harness directory.
+A separate **scale test** (`python/scale_test.py`) hits all three API surfaces across N inline tools for N in {0, 1, 2, 5, 10, 15, 20}, then runs a least-squares linear fit to isolate fixed per-request overhead from per-tool marginal cost. That data is in the "Per-tool cost analysis" section below.
+
+All requests and responses from the live runs are captured to `flow.json` files in each harness directory.
 
 ## Anthropic results
 
@@ -76,32 +79,38 @@ The deferred overhead is **constant regardless of catalog size** for both varian
 - That makes Anthropic's tool_search system prompt **by far the chunkiest server tool they ship**. For comparison, `web_search` adds about 200 tokens of overhead on the same model.
 - Break-even versus inline is reached at roughly 2 of these verbose tools. Below that, the entry fee plus the model's narration cost more than you save.
 
-Live two-turn agent run on Sonnet 4.6:
+Live two-turn agent run on Sonnet 4.6 (Anthropic does not get any prompt cache hits in these runs because no `cache_control` breakpoints are set):
 
 | Configuration | Total in | Total out | Combined | Cost / 1M conv | Saving |
 |---|---:|---:|---:|---:|---:|
-| Inline 21 | 6,684 | 364 | 7,048 | **$25,512** | — |
-| Deferred BM25 | 4,690 | 493 | 5,183 | **$21,465** | **$4,047 (16%)** |
-| Deferred regex | **3,388** | **396** | **3,784** | **$16,104** | **$9,408 (37%)** |
+| Inline 21 | 6,684 | 357 | 7,041 | **$25,407** | — |
+| Deferred BM25 | 3,707 | 453 | 4,160 | **$17,916** | **$7,491 (29%)** |
+| Deferred regex | 4,002 | 417 | 4,419 | **$18,261** | **$7,146 (28%)** |
 
 What the live run reveals that `count_tokens` cannot:
 
-- **Deferred turn 1 is much larger than the 765-token static count.** The extra is the **post-search injection**: tool_search actually fires mid-turn, matches a handful of tools, and their definitions are loaded into the same turn before the model produces its tool call. BM25 turn 1 came in around 2,500 tokens, regex around 2,000.
-- **Regex returned a smaller matched set than BM25.** BM25 ranked several monitoring and ticketing candidates and loaded them all. Regex issued `{"pattern": "incident"}` and the server returned only the tools whose names actually contained that substring. That precision compounds across turns.
-- **Turn 2 input drops sharply for both deferred variants** because only the matched tool definitions persist in the transcript via the `tool_search_tool_result` content block. The other tools are gone forever.
-- **Output tokens are notably higher on the deferred path** because the model narrates its search ("Let me find the right tool to query incidents…"). Sonnet 4.6 narrates more than 4.5 did in my earlier runs, around 150 to 250 tokens per search invocation. You can suppress this with a short system instruction, at some risk to reliability.
-- **BM25 savings collapsed from 25% on Sonnet 4.5 to 16% on Sonnet 4.6 on the same task.** Sonnet 4.6 issues broader BM25 queries and loads more candidate tools per search than 4.5 did. Regex is unaffected because the pattern stays narrow regardless of model verbosity. If you are on 4.6 and your catalog supports it, regex is now the clear default.
+- **Deferred turn 1 is much larger than the 765-token static count.** The extra is the **post-search injection**: tool_search actually fires mid-turn, matches a handful of tools, and their definitions are loaded into the same turn before the model produces its tool call. BM25 turn 1 lands around 2,000-2,500 tokens depending on how many candidates the search returned, regex around 1,800-2,300.
+- **Turn 2 input drops sharply** because only the matched tool definitions persist in the transcript via the `tool_search_tool_result` content block. The other tools are gone forever.
+- **Output tokens are notably higher on the deferred path** because the model narrates its search ("Let me find the right tool to query incidents…"). Sonnet 4.6 narrates around 150 to 250 tokens per search invocation. You can suppress this with a short system instruction, at some risk to reliability.
 
 ### BM25 versus regex
 
-**Regex beats BM25 by a wide margin on this task on Sonnet 4.6** ($9,408 vs $4,047 saved per million conversations), despite its 25-token-higher entry fee. The reason is precision:
+In *some* runs regex beats BM25 substantially. In other runs they come out almost identical, or BM25 wins. Across the runs I've captured on the same task, same catalog, same model:
 
-- **BM25** issued a free-text query like `{"query": "P1 incidents open last 24 hours"}` and the server returned several ranked candidates across monitoring and ticketing. All of them got injected.
-- **Regex** issued `{"pattern": "incident"}` and the server returned only the tools whose names actually contained that substring. The injected set was much smaller.
+| Run | Model | BM25 combined | Regex combined | Winner |
+|---|---|---:|---:|---|
+| A | Sonnet 4.5 | 4,324 | 3,518 | regex by 806 |
+| B | Sonnet 4.6 | 5,183 | 3,784 | regex by 1,399 |
+| C | Sonnet 4.6 | 4,160 | 4,419 | BM25 by 259 |
 
-That precision is a double-edged sword. Regex requires the model to write a pattern that hits your catalog's actual naming. A typo, a case mismatch, or a vocabulary mismatch returns nothing and the model has to search again. For a well-curated internal catalog with consistent naming (every monitoring tool prefixed with `monitoring_`, every ticket tool with `ticket_`, and so on) regex is the right default because the model can infer the pattern from the prefix convention. For a heterogeneous catalog assembled from many MCP servers with inconsistent naming, BM25's ranked keyword matching is more forgiving.
+**The variance is large enough that any single measurement is unreliable as a recommendation.** The model is non-deterministic about how it issues the search query. Sometimes regex picks a tight pattern like `incident` and returns one matching tool; other times it picks something broader and loads several. Sometimes BM25 issues a focused free-text query; other times it goes wide. On this 21-tool catalog with the model picking, both variants land in the same ballpark when averaged across multiple runs.
 
-My recommendation: default to regex if you control the catalog and can enforce naming conventions. Default to BM25 if your catalog is assembled from third-party sources or if you cannot guarantee naming discipline. Nothing stops you from offering both tools in a single request; the model will pick one per turn.
+The mechanism difference still matters in design:
+
+- **BM25** ranks free-text queries against tool descriptions. Robust on heterogeneous catalogs where you cannot rely on naming conventions, because synonyms and word overlap recover from vocabulary mismatches. Brittle if your tool descriptions use different vocabulary than the user's request.
+- **Regex** matches a pattern against tool names and descriptions. Tightest possible retrieval *if* the model can infer your naming convention from the catalog (e.g. every monitoring tool prefixed `monitoring_`). Returns nothing and forces a re-search if the model's pattern is wrong.
+
+My provisional recommendation: default to **BM25** for catalogs assembled from third-party MCP servers or anywhere you cannot guarantee naming discipline. Default to **regex** if you fully control the catalog and your tool names follow predictable prefixes. Better still, run both against your real catalog and your real workload over a few hundred turns and pick the winner empirically. Single-run measurements (including the ones in this writeup) are inadequate signal.
 
 ## OpenAI results
 
@@ -119,13 +128,42 @@ Token counts via `/v1/responses` with `tool_choice: none` and `max_output_tokens
 
 The namespace overhead (399 tokens) is smaller than Anthropic's 685 but larger than 3 inline OpenAI tools (278 tokens), so on a tiny catalog you actually pay more for tool search than you save. Break-even is around 4 to 5 of these verbose tools.
 
-Live two-turn agent run:
+Live two-turn agent run, with OpenAI's automatic prompt cache hits visible. Costs use the **uncached list rate** ($2.50/MTok input) for both input and cached input — i.e. a dry-run cost as if caching were disabled, for honest comparison against Anthropic which currently has no breakpoints set. The `cached` column shows how many of those input tokens **were** served from cache, so you can see the cache discount that *would* apply in steady state.
 
-| Configuration | Total in | Total out | Combined | Cost / 1M conv | Saving |
-|---|---:|---:|---:|---:|---:|
-| Inline 21 | 3,172 | 118 | 3,290 | **$9,700** | — |
-| Deferred flat 21 | 4,132 | 125 | 4,257 | **$12,205** | **−$2,505 (worse)** |
-| Deferred namespace 21 | **1,786** | **137** | **1,923** | **$6,520** | **$3,180 (33%)** |
+| Configuration | Total in | Cached | Out | Combined | Cost / 1M conv (dry) | Saving |
+|---|---:|---:|---:|---:|---:|---:|
+| Inline 21 | 3,172 | **2,816** | 119 | 3,291 | **$9,715** | — |
+| Deferred flat 21 | 4,132 | 3,328 | 122 | 4,254 | **$12,160** | **−$2,445 (worse)** |
+| Deferred namespace 21 | **1,786** | **0** | 135 | 1,921 | **$6,490** | **$3,225 (33%)** |
+
+### The 1,024-token cache threshold (and why it inverts the conclusion in steady state)
+
+OpenAI's automatic prompt cache requires a **stable prefix of at least 1,024 tokens** to fire. Below that threshold, no caching happens at all. The scale test below confirms this exactly: the cache started firing at N=15 inline tools (1,024 tokens cached) and N=20 (1,280 cached), and never fired at N=10 or below.
+
+This has a critical and counter-intuitive consequence for the live runs:
+
+- **Inline 21 (1,532-token static prefix)** crosses the threshold. 92% of its input tokens hit the cache in turn 2 (`cached: 2,816 / 3,172`). With the cache discount applied at ~10% of normal, the *real* billed cost in steady state is dramatically lower than the $9,715 dry-run number.
+- **Deferred namespace 21 (475-token static prefix, 843 turn-1 input)** is **below the threshold**. Both turns show `cached: 0`. Namespace-deferred never participates in OpenAI's automatic prompt cache because its prefix is too small.
+
+In steady state with cache discount applied, the inline path becomes effectively cheaper than the namespace-deferred path:
+
+```
+Inline 21 effective billed cost ≈ 356 uncached × $2.50 + 2,816 cached × $0.25 + 119 × $15
+                                ≈ $0.89 + $0.70 + $1.79
+                                ≈ $3.38 per 1k conversations
+                                ≈ $3,380 per 1M conversations
+
+Deferred namespace effective billed cost ≈ 1,786 × $2.50 + 135 × $15
+                                         ≈ $4.47 + $2.03
+                                         ≈ $6.50 per 1k conversations
+                                         ≈ $6,500 per 1M conversations
+```
+
+**Inline becomes ~2x cheaper than namespace-deferred in cache-warm steady state.** The "namespace deferred saves 33%" headline only holds for cold-cache, dry-run measurements.
+
+The honest framing: server-side tool search on OpenAI is a clean win on **cold cache** and on workloads where the catalog is too large to cache effectively, but on a warm-cache workload with a stable inline prefix, automatic prompt caching beats it.
+
+### OpenAI's biggest footgun: flat defer_loading
 
 ### OpenAI's biggest footgun: flat defer_loading
 
@@ -153,6 +191,53 @@ The only configuration that actually defers is wrapping your functions in a name
 ```
 
 The `defer_loading` flag goes on each child function, not on the namespace container itself (the container rejects `defer_loading` with `unknown parameter`). The namespace's `name` and `description` are the only thing the model sees about your catalog until `tool_search` fires, so write them well.
+
+## Per-tool cost analysis
+
+OpenAI's inline tool block is roughly half the size of Anthropic's for the same catalog. To prove this is structural rather than two-point measurement noise, I ran a scale test (`python/scale_test.py`) hitting all three API surfaces across N inline tools for N in {0, 1, 2, 5, 10, 15, 20}, then ran a least-squares linear fit `cost = fixed + per_tool * N` on each.
+
+| N | Anthropic | OpenAI Resp | OpenAI Chat | A-Δ | Resp-Δ | Chat-Δ |
+|---:|---:|---:|---:|---:|---:|---:|
+| 0 | 80 | 76 | 76 | — | — | — |
+| 1 | 718 | 191 | 272 | +638 | +115 | +196 |
+| 2 | 879 | 284 | 365 | +161 | +93 | +93 |
+| 5 | 1,266 | 498 | 579 | +387 | +214 | +214 |
+| 10 | 1,865 | 833 | 914 | +599 | +335 | +335 |
+| 15 | 2,456 | 1,162 | 1,243 | +591 | +329 | +329 |
+| 20 | 3,038 | 1,466 | 1,547 | +582 | +304 | +304 |
+
+Linear fit:
+
+| | Per-tool marginal | Fixed per-request | R² |
+|---|---:|---:|---:|
+| Anthropic Sonnet 4.6 | **133.0** | 464.5 | 0.967 |
+| OpenAI gpt-5.4 (Responses) | **68.4** | 126.7 | 0.997 |
+| OpenAI gpt-5.4 (ChatCompletions) | **70.1** | 183.0 | 0.990 |
+
+OpenAI per-tool marginal as a percentage of Anthropic: **51.4%** (Responses) and **52.7%** (ChatCompletions). Anthropic's R² is slightly worse than OpenAI's because of the first-tool jump anomaly described below; if you exclude N=1 the Anthropic fit gets close to 1.0 too. **OpenAI's per-tool cost is roughly half of Anthropic's, regardless of which OpenAI API you use.**
+
+### What the deltas reveal
+
+Three things jump out of the per-N delta columns:
+
+1. **Anthropic has a massive "first tool" penalty.** Going from 0 tools to 1 tool costs **638** tokens on Anthropic, but going from 1 tool to 2 tools costs only 161, and subsequent tools settle at ~117 tokens each. The 0→1 jump is the entire tool-use system preamble (~520 tokens) that Anthropic injects the moment you supply any tools at all, plus the actual cost of the first tool. OpenAI has the same pattern but much milder: first tool +115 (Responses) or +196 (Chat), subsequent tools ~65.
+2. **ChatCompletions and Responses charge identical per-tool cost from N=2 onward.** The deltas are byte-identical across all three APIs from the second tool on (Anthropic excluded). The only difference between the two OpenAI APIs is the first-tool overhead: ChatCompletions costs 81 more tokens for the first tool because of the extra `{"function": {...}}` wrapper layer in the ChatCompletions tool shape. After that, the wrapper appears to be tokenized via merges or collapsed server-side and the per-tool cost is identical.
+3. **The OpenAI fit is essentially perfectly linear.** R² = 0.997 (Responses) and 0.990 (Chat). This is as clean as scaling laws get in production APIs.
+
+### Where the 2x gap comes from
+
+Three contributing factors stack:
+
+1. **Tokenizer efficiency.** OpenAI's `o200k` vocabulary has aggressive merges for common JSON constructs (`{"type":"`, `"properties":`, `"description":`, schema keywords). Anthropic's tokenizer is less optimised for JSON. Side experiments suggest this accounts for around a third of the gap.
+2. **Tool format wrapper.** Anthropic wraps each tool in `{name, description, input_schema}`. OpenAI Responses uses `{type, name, description, parameters}`. The shapes are similar in JSON length, but Anthropic appears to render each tool with more explicit structural framing in the model's actual prompt context.
+3. **System-injected tool-use instructions.** Both providers prepend hidden system instructions teaching the model how to call the tools you supplied. Anthropic's preamble is ~520 tokens versus OpenAI's ~50 tokens (you can see this in the 0→1 jump). Some of that verbosity also scales per tool. The same 1.7x ratio shows up in the tool_search system prompts themselves (685 tokens for Anthropic's BM25 versus 399 for OpenAI's `tool_search`), which strongly suggests the same root cause.
+
+### What this means in practice
+
+- **Anthropic has more to gain from tool search** because its inline cost is bigger to start with. You can see this in the dollar savings: the deferred path saves more in absolute terms on Anthropic than on OpenAI, despite OpenAI's smaller starting cost.
+- **The Anthropic premium is partly buying you something.** Some of those extra tokens are tool-use system instructions and stronger schema-following discipline, not pure waste. This single-task setup does not exercise that, but on workloads with many similar tools the model has to disambiguate between, the premium may be paying for itself in correctness.
+- **ChatCompletions cannot use server-side tool search at all.** `tool_search` is documented as Responses-only. ChatCompletions users have no choice but inline tools or client-side filtering, so the entire deferred-tool story in this writeup does not apply to them. Migrating from ChatCompletions to Responses is a prerequisite for using server-side tool search.
+- **Prompt caching narrows the gap.** Cached input is billed at roughly 10% on both providers. A steady-state inline workload with high cache hit rates closes most of the dollar gap, because the bulky Anthropic tool block becomes mostly cached. The numbers in this writeup are uncached worst-case.
 
 ## Provider-specific details
 
@@ -431,39 +516,43 @@ The short answer: doing tool search client-side as a tool round-trip adds a full
 
 ## Cross-provider summary
 
-For the same 21-tool catalog and the same agent task, combined input + output tokens across the full two-turn run, with cost per 1 million conversations at list prices:
+For the same 21-tool catalog and the same agent task, combined input + output tokens across the full two-turn live run, with cost per 1 million conversations at list pricing. **All numbers are dry-run cost (no cache discount applied)** so the comparison is fair to Anthropic, which has no `cache_control` breakpoints set in this test:
 
 | Provider | Best inline | Best deferred | Inline cost / 1M | Deferred cost / 1M | Saving |
 |---|---:|---:|---:|---:|---:|
-| Anthropic Sonnet 4.6 (BM25) | 7,048 | 5,183 | $25,512 | $21,465 | $4,047 (16%) |
-| Anthropic Sonnet 4.6 (regex) | 7,048 | **3,784** | $25,512 | **$16,104** | **$9,408 (37%)** |
-| OpenAI gpt-5.4 (namespace) | 3,290 | **1,923** | $9,700 | **$6,520** | $3,180 (33%) |
+| Anthropic Sonnet 4.6 (BM25) | 7,041 | 4,160 | $25,407 | $17,916 | $7,491 (29%) |
+| Anthropic Sonnet 4.6 (regex) | 7,041 | 4,419 | $25,407 | $18,261 | $7,146 (28%) |
+| OpenAI gpt-5.4 (namespace) | 3,291 | **1,921** | $9,715 | **$6,490** | **$3,225 (33%)** |
 
 Observations beyond the headline numbers:
 
-- **OpenAI gpt-5.4 is roughly 2.6 times cheaper than Anthropic Sonnet 4.6 for this workload at list pricing**, before either side enables tool search. Most of that gap is the lower per-tool serialization cost combined with a slightly cheaper input rate.
-- **The dollar savings from tool search are larger on Anthropic in absolute terms** ($9,408 with regex, $4,047 with BM25, versus $3,180 on OpenAI), even though OpenAI's tool block is smaller to start with. Anthropic users have more to gain because their inline cost is higher.
-- **Anthropic's regex variant is the biggest percentage saving on this task** (37%), narrowly ahead of OpenAI's namespace mode (33%) and well ahead of BM25 (16%). The BM25 result on Sonnet 4.6 is notably worse than what 4.5 achieved on the same task because 4.6 issues broader queries and loads more candidates per search. Regex is unaffected by this behavioural change.
-- **Prompt caching narrows the gap further on the inline side.** The inline OpenAI run shows `cached_tokens: 1408` automatically, billed at roughly 10% of normal. A steady-state inline workload with good cache hit rates is much closer in real cost to a deferred workload than the raw numbers suggest. On Anthropic you must add `cache_control` breakpoints to get the same effect.
-- **At volume the savings compound fast.** An agent platform doing 10 million conversations a month would save $94,080 a month on Anthropic with regex and $31,800 a month on OpenAI by switching from inline to deferred tools, before any prompt-caching effects.
+- **OpenAI gpt-5.4 is roughly 2.6 times cheaper than Anthropic Sonnet 4.6 for this workload at list pricing**, before either side enables tool search. Most of that gap is the lower per-tool serialization cost (~51% per tool, see the per-tool cost analysis section) combined with a slightly cheaper input rate.
+- **The dollar savings from tool search are larger on Anthropic in absolute terms** (~$7,500 versus $3,225 on OpenAI), even though OpenAI's tool block is smaller to start with. Anthropic users have more to gain because their inline cost is higher.
+- **BM25 vs regex on Anthropic is run-to-run noisy.** This particular run had BM25 narrowly ahead. Other runs have regex ahead by up to 35%. Treat them as roughly equivalent on this catalog and run your own measurements before committing to either.
+- **Prompt caching changes the OpenAI ranking entirely.** The inline OpenAI run shows ~92% of input tokens served from cache automatically. With cache discount applied (cached input billed at ~10% of normal), the inline path drops to roughly $3,400 per 1M conversations, **cheaper than namespace-deferred** because namespace-deferred falls below the 1,024-token cache threshold and gets zero caching at all. The "namespace saves 33%" headline only holds on cold-cache, dry-run measurements. On a warm-cache workload the relationship inverts.
+- **Anthropic has no caching in this test by design.** Anthropic's prompt cache is opt-in via `cache_control` breakpoints which I have not added. The Anthropic numbers are honest full-price. With breakpoints set on the system prompt or tool block, Anthropic can also achieve ~90% cached input on warm runs, which would similarly close the inline-vs-deferred gap.
+- **At volume the dry-run savings compound fast.** An agent platform doing 10 million conversations a month would save ~$74,910 on Anthropic and $32,250 on OpenAI by switching from inline to deferred tools, before any prompt-caching effects.
 
-The providers have different strengths beyond raw price. Anthropic's BM25 and regex give you two retrieval primitives to pick from, both forgiving on heterogeneous catalogs if chosen correctly. OpenAI's namespace-path approach is faster and cheaper but assumes you can structure your catalog hierarchically.
+The providers have different strengths beyond raw price. Anthropic gives you two retrieval primitives (BM25 and regex) to pick from, both forgiving on heterogeneous catalogs if chosen correctly. OpenAI's namespace-path approach is faster and cheaper at the deferred entry fee, but the static cost is small enough to fall below the cache threshold, which makes it a net loss on warm-cache workloads.
 
 ## Caveats
 
 - All numbers are from a single task on a single 21-tool catalog. The "best deferred" winner depends on the ratio of total catalog size to tools-actually-needed-per-turn. A workload that needs a different tool every turn defeats both deferred-loading mechanisms because each turn pays the search cost again.
-- **Regex vs BM25 on Anthropic is both model-dependent and catalog-dependent.** Regex won on this task because the model inferred a clean `incident` pattern from the catalog's naming convention, and because Sonnet 4.6 happens to issue broad BM25 queries. Older Sonnet 4.5 closed the BM25 gap to ~25%. On a catalog where the model has to guess the naming, regex will miss and fall back to another search. Measure both against your own catalog and your target model before committing.
-- OpenAI's `gpt-5.4` is brand new and the tool_search feature is partly undocumented. The namespace shape used here was reverse-engineered from API error messages and may change before GA.
-- Anthropic's `count_tokens` endpoint underestimates the deferred path because it does not simulate the search firing. The live run is the only way to see the real post-search cost.
-- Prompt caching skews any inline-vs-deferred comparison in the deferred path's disfavour over time. A stable inline tool block with caching enabled may be cheaper per request in steady state than a deferred block that pays the search cost on the first request of each new conversation. Measure your real workload.
+- **Regex vs BM25 on Anthropic varies significantly run to run.** I have captured runs where regex wins by up to 35%, runs where they tie, and runs where BM25 wins narrowly. The model is non-deterministic about how it issues the search query. Single-measurement claims about which variant wins are not reliable. Run multiple iterations against your real catalog before committing.
+- **OpenAI prompt caching changes the inline-vs-deferred ranking.** OpenAI's automatic prompt cache requires a stable prefix of at least 1,024 tokens. Inline 21 tools (1,532 tokens) crosses the threshold and caches; namespace-deferred (475 static, 843 turn-1) does not, and gets zero cache hits. In steady state with the cache discount applied, inline becomes cheaper than namespace-deferred. The dry-run numbers in this writeup do not apply that discount, so the headline "33% saving" only holds on cold caches.
+- **Anthropic gets no caching at all in these numbers** because I have not added `cache_control` breakpoints. The Anthropic numbers are full-price honest, but they are not directly comparable to OpenAI's *steady-state-with-cache* cost. To put both providers on equal footing in steady state, you would need to add Anthropic cache breakpoints and rerun.
+- **OpenAI's `gpt-5.4` is brand new and the tool_search feature is partly undocumented.** The namespace shape used here was reverse-engineered from API error messages and may change before GA.
+- **Anthropic's `count_tokens` endpoint underestimates the deferred path** because it does not simulate the search firing. The live run is the only way to see the real post-search cost.
+- **ChatCompletions cannot use server-side tool search at all.** It is Responses-only on OpenAI. Most production OpenAI integrations are still on ChatCompletions and have to migrate to Responses before any of the deferred-tool story applies.
 
 ## Reproducing
 
-| Harness | Run from | Required env |
-|---|---|---|
-| Anthropic C# | `csharp/anthropic/` | `ANTHROPIC_API_KEY` |
-| OpenAI C# | `csharp/openai/` | `OPENAI_API_KEY` |
-| Anthropic Python | `python/anthropic/` | `ANTHROPIC_API_KEY` |
-| OpenAI Python | `python/openai/` | `OPENAI_API_KEY` |
+All harnesses are Python with stdlib only, no external dependencies. Run from each subdirectory:
 
-C# harnesses: `dotnet run`. Python harnesses: `python3 anthropic_test.py` or `python3 openai_test.py` (no dependencies, stdlib only). Each writes a `flow.json` file alongside the script containing the full request and response bodies for every HTTP exchange, tagged by scenario, suitable for `jq` inspection.
+| Harness | Command | Required env |
+|---|---|---|
+| Anthropic | `cd python/anthropic && python3 anthropic_test.py` | `ANTHROPIC_API_KEY` |
+| OpenAI Responses | `cd python/openai && python3 openai_test.py` | `OPENAI_API_KEY` |
+| Cross-provider scale test | `cd python && python3 scale_test.py` | both keys |
+
+The Anthropic and OpenAI harnesses each write a `flow.json` (or `flow_anthropic.json` / `flow_openai.json`) alongside the script, containing full request and response bodies for every HTTP exchange, tagged by scenario, suitable for `jq` inspection. The scale test writes its results to stdout only and prints the linear-fit numbers used in the per-tool cost analysis section.

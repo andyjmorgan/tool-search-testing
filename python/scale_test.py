@@ -67,6 +67,42 @@ def anthropic_count(n: int) -> int:
     return resp["input_tokens"]
 
 
+def openai_chat_count(n: int) -> tuple[int, int]:
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": t["name"],
+                "description": t["description"],
+                "parameters": t["schema"],
+            },
+        }
+        for t in CATALOG[:n]
+    ]
+    body = {
+        "model": OPENAI_MODEL,
+        "messages": [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": USER_PROMPT},
+        ],
+        "max_completion_tokens": 16,
+    }
+    if tools:
+        body["tools"] = tools
+        body["tool_choice"] = "none"
+    resp = post(
+        "https://api.openai.com/v1/chat/completions",
+        {
+            "authorization": f"Bearer {OPENAI_KEY}",
+            "content-type": "application/json",
+        },
+        body,
+    )
+    usage = resp["usage"]
+    cached = usage.get("prompt_tokens_details", {}).get("cached_tokens", 0)
+    return usage["prompt_tokens"], cached
+
+
 def openai_count(n: int) -> tuple[int, int]:
     tools = [
         {
@@ -114,39 +150,46 @@ def main() -> None:
     if max(N_VALUES) > len(CATALOG):
         sys.exit(f"catalog only has {len(CATALOG)} tools; cannot request {max(N_VALUES)}")
 
-    print(f"Scale test: N tools inline, both providers")
+    print(f"Scale test: N tools inline, three API surfaces")
     print(f"Catalog size: {len(CATALOG)}, requesting N in {N_VALUES}\n")
-    print(f"{'N':>4} | {'Anthropic':>10} | {'OpenAI':>10} | {'O cached':>10} | {'A-Δ':>8} | {'O-Δ':>8} | {'O/A':>6}")
+    print(f"{'N':>4} | {'Anthropic':>10} | {'OAI Resp':>10} | {'OAI Chat':>10} | {'A-Δ':>7} | {'R-Δ':>7} | {'C-Δ':>7}")
     print("-" * 75)
 
     a_results: list[int] = []
     o_results: list[int] = []
-    a_prev = o_prev = None
+    c_results: list[int] = []
+    a_prev = o_prev = c_prev = None
     for n in N_VALUES:
         a = anthropic_count(n)
-        o, o_cached = openai_count(n)
+        o, _ = openai_count(n)
+        c, _ = openai_chat_count(n)
         a_results.append(a)
         o_results.append(o)
+        c_results.append(c)
         a_delta = "" if a_prev is None else str(a - a_prev)
         o_delta = "" if o_prev is None else str(o - o_prev)
-        ratio = f"{o/a:.2f}" if a else "n/a"
-        print(f"{n:>4} | {a:>10} | {o:>10} | {o_cached:>10} | {a_delta:>8} | {o_delta:>8} | {ratio:>6}")
-        a_prev, o_prev = a, o
+        c_delta = "" if c_prev is None else str(c - c_prev)
+        print(f"{n:>4} | {a:>10} | {o:>10} | {c:>10} | {a_delta:>7} | {o_delta:>7} | {c_delta:>7}")
+        a_prev, o_prev, c_prev = a, o, c
 
     print()
     print("Linear fit  (cost = fixed + per_tool * N)")
     print("-" * 60)
     a_fixed, a_per = linear_fit(N_VALUES, a_results)
     o_fixed, o_per = linear_fit(N_VALUES, o_results)
-    print(f"  Anthropic : fixed = {a_fixed:>8.1f}    per_tool = {a_per:>6.2f}")
-    print(f"  OpenAI    : fixed = {o_fixed:>8.1f}    per_tool = {o_per:>6.2f}")
+    c_fixed, c_per = linear_fit(N_VALUES, c_results)
+    print(f"  Anthropic     : fixed = {a_fixed:>8.1f}    per_tool = {a_per:>6.2f}")
+    print(f"  OpenAI Resp   : fixed = {o_fixed:>8.1f}    per_tool = {o_per:>6.2f}")
+    print(f"  OpenAI Chat   : fixed = {c_fixed:>8.1f}    per_tool = {c_per:>6.2f}")
     print()
-    print(f"  OpenAI per-tool as % of Anthropic per-tool : {100 * o_per / a_per:.1f}%")
-    print(f"  OpenAI fixed   as % of Anthropic fixed     : {100 * o_fixed / a_fixed:.1f}%")
+    print(f"  OAI Resp per-tool as % of Anthropic    : {100 * o_per / a_per:.1f}%")
+    print(f"  OAI Chat per-tool as % of Anthropic    : {100 * c_per / a_per:.1f}%")
+    print(f"  OAI Chat per-tool as % of OAI Resp     : {100 * c_per / o_per:.1f}%")
     print()
     print("R^2 sanity check (closer to 1.0 = better linear fit):")
-    print(f"  Anthropic R^2 = {r_squared(N_VALUES, a_results, a_fixed, a_per):.5f}")
-    print(f"  OpenAI    R^2 = {r_squared(N_VALUES, o_results, o_fixed, o_per):.5f}")
+    print(f"  Anthropic    R^2 = {r_squared(N_VALUES, a_results, a_fixed, a_per):.5f}")
+    print(f"  OpenAI Resp  R^2 = {r_squared(N_VALUES, o_results, o_fixed, o_per):.5f}")
+    print(f"  OpenAI Chat  R^2 = {r_squared(N_VALUES, c_results, c_fixed, c_per):.5f}")
 
 
 def r_squared(xs: list[int], ys: list[int], a: float, b: float) -> float:
