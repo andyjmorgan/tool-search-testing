@@ -1,5 +1,7 @@
 # tool-search-testing
 
+![Server-side tool search on Anthropic and OpenAI](./hero.png)
+
 Test harnesses for **server-side tool search** on Anthropic Claude and OpenAI gpt-5.4. Both providers shipped this feature in the last few weeks. Almost nobody is talking about it.
 
 The harnesses run the same 21-tool catalog and the same agent task against each provider, capture every HTTP request and response, and report what tool search actually costs in tokens and dollars.
