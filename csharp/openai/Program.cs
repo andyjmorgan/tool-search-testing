@@ -95,7 +95,7 @@ JsonObject BaseRequest(JsonArray? toolsArray, JsonNode? input = null)
     return req;
 }
 
-async Task<long> CountInputTokens(string label, JsonObject request, string scenario)
+async Task<(long input, long cached)> CountInputTokens(string label, JsonObject request, string scenario)
 {
     capture.CurrentScenario = scenario;
     using var content = new StringContent(request.ToJsonString(), Encoding.UTF8, "application/json");
@@ -104,12 +104,13 @@ async Task<long> CountInputTokens(string label, JsonObject request, string scena
     if (!resp.IsSuccessStatusCode)
     {
         Console.WriteLine($"  {label} : ERROR {(int)resp.StatusCode} {body}");
-        return -1;
+        return (-1, -1);
     }
     var json = JsonNode.Parse(body)!.AsObject();
     var inT = json["usage"]?["input_tokens"]?.GetValue<long>() ?? -1;
-    Console.WriteLine($"  {label} : {inT,6}");
-    return inT;
+    var cached = json["usage"]?["input_tokens_details"]?["cached_tokens"]?.GetValue<long>() ?? 0;
+    Console.WriteLine($"  {label} : in={inT,6}  cached={cached,5}");
+    return (inT, cached);
 }
 
 Console.WriteLine("Counting tokens via /v1/responses (max_output_tokens=16, tool_choice=none)...\n");
@@ -133,14 +134,19 @@ var t5b = await CountInputTokens("5b. Prompt + 3 tools deferred (namespace) ",
 
 Console.WriteLine();
 Console.WriteLine("─────────────────────────────────────────────");
-if (t1 > 0)
+Console.WriteLine("Cost / 1M req at $2.50/MTok input (dry run, no cache discount applied):");
+PrintCost("21 inline           ", t2);
+PrintCost("21 deferred flat    ", t3);
+PrintCost("21 deferred namespace", t3b);
+PrintCost(" 3 inline           ", t4);
+PrintCost(" 3 deferred flat    ", t5);
+PrintCost(" 3 deferred namespace", t5b);
+
+void PrintCost(string label, (long input, long cached) m)
 {
-    Console.WriteLine($"21 tools — inline overhead       : {t2 - t1,6}");
-    Console.WriteLine($"21 tools — deferred flat         : {(t3 > 0 ? (t3 - t1).ToString() : "n/a"),6}");
-    Console.WriteLine($"21 tools — deferred namespace    : {(t3b > 0 ? (t3b - t1).ToString() : "n/a"),6}");
-    Console.WriteLine($" 3 tools — inline overhead       : {t4 - t1,6}");
-    Console.WriteLine($" 3 tools — deferred flat         : {(t5 > 0 ? (t5 - t1).ToString() : "n/a"),6}");
-    Console.WriteLine($" 3 tools — deferred namespace    : {(t5b > 0 ? (t5b - t1).ToString() : "n/a"),6}");
+    if (m.input <= 0) { Console.WriteLine($"  {label} : n/a"); return; }
+    var raw = m.input * 2.5;
+    Console.WriteLine($"  {label} : input={m.input,6}  cached={m.cached,5}  cost=${raw,8:N2}");
 }
 
 Console.WriteLine();
@@ -178,7 +184,7 @@ async Task RunAgent(string label, JsonArray toolsArray, string scenario)
         },
     };
 
-    long totalIn = 0, totalOut = 0;
+    long totalIn = 0, totalCached = 0, totalOut = 0;
 
     for (int turn = 1; turn <= 5; turn++)
     {
@@ -202,11 +208,13 @@ async Task RunAgent(string label, JsonArray toolsArray, string scenario)
 
         var json = JsonNode.Parse(body)!.AsObject();
         var inT = json["usage"]?["input_tokens"]?.GetValue<long>() ?? 0;
+        var cachedT = json["usage"]?["input_tokens_details"]?["cached_tokens"]?.GetValue<long>() ?? 0;
         var outT = json["usage"]?["output_tokens"]?.GetValue<long>() ?? 0;
         var status = json["status"]?.GetValue<string>() ?? "?";
         totalIn += inT;
+        totalCached += cachedT;
         totalOut += outT;
-        Console.WriteLine($"  turn {turn}: in={inT,6}  out={outT,5}  status={status}");
+        Console.WriteLine($"  turn {turn}: in={inT,6}  cached={cachedT,5}  out={outT,5}  status={status}");
 
         var output = json["output"]?.AsArray() ?? new JsonArray();
         var localCalls = new List<(string callId, string name)>();
@@ -262,7 +270,9 @@ async Task RunAgent(string label, JsonArray toolsArray, string scenario)
         }
     }
 
-    Console.WriteLine($"  TOTAL : in={totalIn}  out={totalOut}  combined={totalIn + totalOut}");
+    var rawCost = totalIn * 2.5 + totalOut * 15.0;
+    Console.WriteLine($"  TOTAL : in={totalIn}  cached={totalCached}  out={totalOut}  combined={totalIn + totalOut}");
+    Console.WriteLine($"  COST  : ${rawCost,8:N2} / 1M conv (dry run, no cache discount)");
 }
 
 static string MockExecute(string toolName) => toolName switch

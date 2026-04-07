@@ -130,7 +130,7 @@ async Task RunAgent(string label, IReadOnlyList<Beta.BetaToolUnion> toolsList)
 {
     Console.WriteLine($"\n--- {label} ---");
     var conversation = new List<Beta.BetaMessageParam> { userMessage };
-    long totalIn = 0, totalOut = 0;
+    long totalIn = 0, totalOut = 0, totalCacheRead = 0, totalCacheCreation = 0;
 
     for (int turn = 1; turn <= 5; turn++)
     {
@@ -146,9 +146,13 @@ async Task RunAgent(string label, IReadOnlyList<Beta.BetaToolUnion> toolsList)
         var resp = await client.Beta.Messages.Create(req);
         var inT = resp.Usage?.InputTokens ?? 0;
         var outT = resp.Usage?.OutputTokens ?? 0;
+        var cacheRead = resp.Usage?.CacheReadInputTokens ?? 0;
+        var cacheCreation = resp.Usage?.CacheCreationInputTokens ?? 0;
+        totalCacheRead += cacheRead;
+        totalCacheCreation += cacheCreation;
         totalIn += inT;
         totalOut += outT;
-        Console.WriteLine($"  turn {turn}: in={inT,6}  out={outT,5}  stop={resp.StopReason}");
+        Console.WriteLine($"  turn {turn}: in={inT,6}  cache_read={cacheRead,5}  cache_create={cacheCreation,5}  out={outT,5}  stop={resp.StopReason}");
 
         var assistantBlocks = new List<Beta.BetaContentBlockParam>();
         var localCalls = new List<(string id, string name, string inputJson)>();
@@ -216,7 +220,9 @@ async Task RunAgent(string label, IReadOnlyList<Beta.BetaToolUnion> toolsList)
         });
     }
 
-    Console.WriteLine($"  TOTAL : in={totalIn}  out={totalOut}  combined={totalIn + totalOut}");
+    var rawCost = totalIn * 3.0 + totalOut * 15.0;
+    Console.WriteLine($"  TOTAL : in={totalIn}  cache_read={totalCacheRead}  cache_create={totalCacheCreation}  out={totalOut}  combined={totalIn + totalOut}");
+    Console.WriteLine($"  COST  : ${rawCost,8:N2} / 1M conv (dry run, no cache discount)");
 }
 
 static string MockExecute(string toolName) => toolName switch
