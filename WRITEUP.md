@@ -381,6 +381,54 @@ A few non-obvious things worth keeping in mind once the integration is working.
 - **Budget for narration.** Models burn 50 to 200 output tokens narrating their search on the first turn. A short system instruction suppressing narration ("do not announce tool searches, just execute them") recovers most of that cost with no apparent reliability impact.
 - **Multiple search calls per session are fine.** The model will issue another `tool_search_call` if a later turn needs a tool it has not loaded yet. Total cost grows linearly with the number of distinct tools used, not with the size of the catalog.
 
+## Why not just do this client-side?
+
+The obvious alternative to server-side tool search is to do retrieval client-side: take the user query, run your own filtering, and send only the relevant tools inline. This is what most "tool search MCP" projects on r/mcp are doing. There are two distinct ways to implement it and they have very different cost profiles.
+
+### Approach 1: pre-filter before the first call
+
+You take the user query, run local retrieval (BM25 index, embedding similarity, LLM router), pick the top N tools, and send only those inline. The model never sees the deferred catalog, never round-trips through a search tool. There is no extra round-trip with the model, just one extra step on your side before the API call.
+
+If your retrieval is good and you pick 5 out of 21 tools correctly, the per-turn cost on Sonnet 4.6 is roughly `80 + 5 * 151 ≈ 835` input tokens, which is **lower than server-side regex**. If retrieval works, this is the cheapest possible shape.
+
+The catches:
+
+- **Retrieval has its own cost.** Local BM25 or embedding similarity is essentially free at runtime but you pay maintenance and infrastructure. An LLM router costs around $0.0001 per request on a small model. Embedding-based retrieval needs an embedding API call per query and a pre-embedded tool index.
+- **The user message alone is rarely a good retrieval query.** Conversations have context. Turn 1 says "tell me about ducks" and turn 2 says "cool, tell me more". The string "cool, tell me more" carries no signal for a retrieval system, but the model needs the same `wildlife_lookup` tool it used on turn 1. To pick the right tools you have to feed the *whole conversation* (or a model-summarised version of it) into the retrieval step on every turn. That means either running an LLM router that reads the transcript (expensive, slow) or maintaining a separate context-tracking layer that summarises the conversation into a retrieval query. Either way it is its own piece of infrastructure with its own failure modes. Server-side tool search avoids this entirely because the model itself is composing the search query with full conversation context already in scope.
+- **Multi-turn behaviour breaks.** Server-side tool search persists loaded tools across turns via the transcript. With pre-filtering you have to decide on every turn what tools to send, and if turn 2 needs a tool turn 1 didn't, your choices are all bad: swap the tools array mid-conversation (undefined behaviour, the model may emit calls to tools it can no longer see), accumulate every tool ever picked (re-inlines your catalog), or re-run retrieval over the whole transcript (slow and expensive).
+- **Prompt caching dies.** A stable inline tool block caches well. A dynamic per-request tool block does not. You lose the roughly 90% discount on cached input across the entire tool block, on every request, for the lifetime of the session. For high-volume workloads this can dwarf any per-request savings from sending fewer tools.
+- **Wrong picks are unrecoverable.** If your retrieval misses the right tool, the model just cannot do the task. It does not know to ask for more tools because it does not know they exist. Server-side tool search lets the model issue another search if the first one missed.
+
+### Approach 2: search as a client-side tool
+
+You expose a `search_tools` function tool to the model. The model emits a tool call, your client runs retrieval, returns the matched tool definitions in the tool result, and the model picks one and calls it. This is what most "tool search MCP" projects are doing.
+
+**This is the round-trip case, and yes, it adds full extra request-response cycles to every search.**
+
+For a single "search then call" task the model produces a `search_tools` call on turn 1, you round-trip retrieval as a `tool_result`, the model parses the matched definitions out of natural language on turn 2 (or you mutate the tools array between turns, which breaks caching), and the model finally calls the matched tool on turn 3. Compared to server-side tool search you pay at least one extra full request-response cycle, the matched tool definitions live in the transcript as text on every subsequent turn (no eviction story unless you build one), and prompt caching is broken because the tools array keeps changing.
+
+For our 21-tool task, modelled cost lands around 5,000 to 6,000 combined tokens. Worse than Anthropic's BM25 result and only marginally better than inline. Nowhere near regex tool search.
+
+### When client-side actually wins
+
+Pre-filter is better than server-side tool search if all four of these are true:
+
+1. Your retrieval is reliable enough that misses are rare and recoverable. Usually means a curated catalog with a controlled query distribution, not a long-tail enterprise mess.
+2. Your conversations are short (one or two turns) so the lack of cross-turn persistence does not matter.
+3. You can absorb the loss of prompt caching, or you have enough request volume to make caching irrelevant.
+4. You are willing to maintain the retrieval system (and a conversation-context summariser) as long-term pieces of your stack.
+
+Server-side tool search is better if any of these hold:
+
+1. Conversations are multi-turn and the loaded set evolves.
+2. You want the model to be able to recover from a missed first match by issuing another search.
+3. You want prompt caching to amortise the search cost across requests in a session.
+4. You don't want to operate a retrieval index or a context summariser.
+
+For most production agent workloads those points all favour server-side. The exception is genuinely large catalogs (200+ tools across many domains) where neither BM25 nor namespace-path retrieval is precise enough and you need a hand-tuned router that knows your domain. That is a real use case but it is not the median.
+
+The short answer: doing tool search client-side as a tool round-trip adds a full extra round-trip of cost and breaks prompt caching, which together usually wipes out any token savings. Pre-filtering can be cheaper but only in single-turn workloads with reliable retrieval, and you trade away robustness, recoverability, conversation-context handling, and cache benefits to get there.
+
 ## Cross-provider summary
 
 For the same 21-tool catalog and the same agent task, combined input + output tokens across the full two-turn run, with cost per 1 million conversations at list prices:
