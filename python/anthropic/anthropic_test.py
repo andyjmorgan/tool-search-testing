@@ -13,7 +13,7 @@ API_KEY = os.environ.get("ANTHROPIC_API_KEY")
 if not API_KEY:
     sys.exit("ANTHROPIC_API_KEY not set")
 
-MODEL = "claude-sonnet-4-5"
+MODEL = "claude-sonnet-4-6"
 BETA_HEADER = os.environ.get("ANTHROPIC_BETA", "advanced-tool-use-2025-11-20")
 BASE = "https://api.anthropic.com"
 

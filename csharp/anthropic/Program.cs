@@ -5,7 +5,7 @@ using Beta = Anthropic.Models.Beta.Messages;
 var apiKey = Environment.GetEnvironmentVariable("ANTHROPIC_API_KEY")
     ?? throw new InvalidOperationException("ANTHROPIC_API_KEY not set");
 
-const string ModelId = "claude-sonnet-4-5";
+const string ModelId = "claude-sonnet-4-6";
 const string SystemPrompt =
     "You are a helpful enterprise operations assistant for ACME Corp. " +
     "You help employees query internal systems including HR, finance, " +
@@ -58,11 +58,13 @@ Beta.BetaTool ToDeferredTool(MockTools.ToolDef t) => new()
 List<Beta.Tool> InlineList(IEnumerable<MockTools.ToolDef> ts) =>
     ts.Select(t => (Beta.Tool)ToInlineTool(t)).ToList();
 
-List<Beta.Tool> DeferredList(IEnumerable<MockTools.ToolDef> ts)
+List<Beta.Tool> DeferredList(IEnumerable<MockTools.ToolDef> ts, string searcher = "bm25")
 {
     var list = new List<Beta.Tool>
     {
-        new Beta.BetaToolSearchToolBm25_20251119 { Type = "tool_search_tool_bm25_20251119" },
+        searcher == "regex"
+            ? new Beta.BetaToolSearchToolRegex20251119 { Type = "tool_search_tool_regex_20251119" }
+            : (Beta.Tool)new Beta.BetaToolSearchToolBm25_20251119 { Type = "tool_search_tool_bm25_20251119" },
     };
     list.AddRange(ts.Select(t => (Beta.Tool)ToDeferredTool(t)));
     return list;
@@ -71,11 +73,13 @@ List<Beta.Tool> DeferredList(IEnumerable<MockTools.ToolDef> ts)
 List<Beta.BetaToolUnion> InlineUnion(IEnumerable<MockTools.ToolDef> ts) =>
     ts.Select(t => (Beta.BetaToolUnion)ToInlineTool(t)).ToList();
 
-List<Beta.BetaToolUnion> DeferredUnion(IEnumerable<MockTools.ToolDef> ts)
+List<Beta.BetaToolUnion> DeferredUnion(IEnumerable<MockTools.ToolDef> ts, string searcher = "bm25")
 {
     var list = new List<Beta.BetaToolUnion>
     {
-        new Beta.BetaToolSearchToolBm25_20251119 { Type = "tool_search_tool_bm25_20251119" },
+        searcher == "regex"
+            ? new Beta.BetaToolSearchToolRegex20251119 { Type = "tool_search_tool_regex_20251119" }
+            : (Beta.BetaToolUnion)new Beta.BetaToolSearchToolBm25_20251119 { Type = "tool_search_tool_bm25_20251119" },
     };
     list.AddRange(ts.Select(t => (Beta.BetaToolUnion)ToDeferredTool(t)));
     return list;
@@ -87,17 +91,20 @@ Console.WriteLine("Counting tokens...\n");
 
 var t1 = await Count("1. Prompt only                            ", MakeParams(null));
 var t2 = await Count("2. Prompt + 21 tools inline               ", MakeParams(InlineList(tools)));
-var t3 = await Count("3. Prompt + 21 tools deferred (search)    ", MakeParams(DeferredList(tools)));
+var t3 = await Count("3. Prompt + 21 tools deferred (BM25)      ", MakeParams(DeferredList(tools, "bm25")));
+var t3r = await Count("3r. Prompt + 21 tools deferred (regex)    ", MakeParams(DeferredList(tools, "regex")));
 var t4 = await Count("4. Prompt + 3 tools inline                ", MakeParams(InlineList(fewTools)));
-var t5 = await Count("5. Prompt + 3 tools deferred (search)     ", MakeParams(DeferredList(fewTools)));
+var t5 = await Count("5. Prompt + 3 tools deferred (BM25)       ", MakeParams(DeferredList(fewTools, "bm25")));
+var t5r = await Count("5r. Prompt + 3 tools deferred (regex)     ", MakeParams(DeferredList(fewTools, "regex")));
 
 Console.WriteLine();
 Console.WriteLine("─────────────────────────────────────────────");
-Console.WriteLine($"21 tools — inline overhead   : {t2 - t1,6}");
-Console.WriteLine($"21 tools — deferred overhead : {t3 - t1,6}");
-Console.WriteLine($" 3 tools — inline overhead   : {t4 - t1,6}");
-Console.WriteLine($" 3 tools — deferred overhead : {t5 - t1,6}");
-Console.WriteLine($"Per-tool deferred-manifest cost (Δ over 18 tools): {(t3 - t5) / 18.0:F1}");
+Console.WriteLine($"21 tools — inline overhead         : {t2 - t1,6}");
+Console.WriteLine($"21 tools — deferred BM25 overhead  : {t3 - t1,6}");
+Console.WriteLine($"21 tools — deferred regex overhead : {t3r - t1,6}");
+Console.WriteLine($" 3 tools — inline overhead         : {t4 - t1,6}");
+Console.WriteLine($" 3 tools — deferred BM25 overhead  : {t5 - t1,6}");
+Console.WriteLine($" 3 tools — deferred regex overhead : {t5r - t1,6}");
 
 Console.WriteLine();
 Console.WriteLine("═════════════════════════════════════════════");
@@ -105,10 +112,13 @@ Console.WriteLine("Live agent runs (real messages.create, mock local tool execut
 Console.WriteLine("═════════════════════════════════════════════");
 
 capture.CurrentScenario = "inline_21";
-await RunAgent("6. Inline 21 tools (live)  ", InlineUnion(tools));
+await RunAgent("6. Inline 21 tools (live)         ", InlineUnion(tools));
 Console.WriteLine();
-capture.CurrentScenario = "deferred_21";
-await RunAgent("7. Deferred 21 tools (live)", DeferredUnion(tools));
+capture.CurrentScenario = "deferred_bm25_21";
+await RunAgent("7. Deferred 21 tools (BM25, live) ", DeferredUnion(tools, "bm25"));
+Console.WriteLine();
+capture.CurrentScenario = "deferred_regex_21";
+await RunAgent("8. Deferred 21 tools (regex, live)", DeferredUnion(tools, "regex"));
 
 var flowPath = Path.Combine(AppContext.BaseDirectory, "..", "..", "..", "flow.json");
 flowPath = Path.GetFullPath(flowPath);
